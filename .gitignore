@@ -2,3 +2,9 @@
 /.venv
 __pycache__/
 *.pyc
+
+# 
+formater.bat
+
+# notebook testing
+/*.ipynb
