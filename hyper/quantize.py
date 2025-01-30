@@ -152,13 +152,16 @@ def dequantize(
         assert compute_precision is not None
     elif compute_precision is None:
         compute_precision = store_precision
+    elif compute_precision != "fp32":
+        compute_precision = store_precision
     compute_dtype = parse_precision(compute_precision)
 
+    scaler_num_bytes = 1 if store_precision == "fp8" else 2
     if symmetric:
-        q, scale = dynamic_split(Q, sizes=(-1, 2), dim=dim + 1)
+        q, scale = dynamic_split(Q, sizes=(-1, scaler_num_bytes), dim=dim + 1)
         xmin = None
     else:
-        q, scale, xmin = dynamic_split(Q, sizes=(-1, 2, 2), dim=dim + 1)
+        q, scale, xmin = dynamic_split(Q, sizes=(-1, scaler_num_bytes, scaler_num_bytes), dim=dim + 1)
 
     q = unpack_bits(q, num_bits, symmetric, group_last, dim=dim + 1)
     scale = unpack_scalar(scale, store_precision, dim=dim + 1)

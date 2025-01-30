@@ -6,7 +6,7 @@ from torch import Tensor
 
 from ._types import Bits
 from .bit_ops import bit_shift, bit_unshift
-from .utils import parse_precision, split_by_ratio
+from .utils import get_bit_mask, parse_precision, split_by_ratio
 
 
 def pack_bits(
@@ -22,9 +22,7 @@ def pack_bits(
     symmetric = q.dtype == torch.int8
     if symmetric:
         q = bit_shift(q, num_bits)
-
-    mask = (1 << num_bits) - 1
-    q = q & mask  # mask out the extra bits
+    q = q & get_bit_mask(num_bits)  # mask out the extra bits
 
     # AAAA_AAAA
     if num_bits == 8:
@@ -90,15 +88,15 @@ def unpack_bits(
 ) -> Tensor:
     assert q.dtype == torch.uint8
 
-    extra_dims = [1] * (q.ndim - dim - 1)
-    mask = (1 << num_bits) - 1
-
     # AAAA_AAAA
     if num_bits == 8:
         pass
 
     # 4bits: AAAA_BBBB | 2bits: AABB_CCDD | 1bits: ABCD_EFGH
     elif num_bits in (4, 2, 1):
+        mask = get_bit_mask(num_bits)
+        extra_dims = [1] * (q.ndim - dim - 1)
+
         idx = torch.arange(0, 8, num_bits, device=q.device, dtype=torch.uint8)
 
         q = q.unflatten(dim, (-1, 1) if group_last else (1, -1))
@@ -108,7 +106,7 @@ def unpack_bits(
 
     # AAAA_BBBB CCCC_DDDD EEEE_FFFF GGGG_HHHH + abcd_efgh
     elif num_bits == 5:
-        q1, q4 = split_by_ratio(q, ratios=(4, 1), dim=dim)
+        q1, q4 = split_by_ratio(q, ratios=(1, 4), dim=dim)
 
         q1 = unpack_bits(q1, num_bits=1, symmetric=False, dim=dim, group_last=group_last)
         q4 = unpack_bits(q4, num_bits=4, symmetric=False, dim=dim, group_last=group_last)
@@ -117,10 +115,10 @@ def unpack_bits(
 
     # AAAA_BBBB CCCC_DDDD + aabb_ccdd
     elif num_bits == 6:
-        q4, q2 = split_by_ratio(q, ratios=(4, 2), dim=dim)
+        q2, q4 = split_by_ratio(q, ratios=(2, 4), dim=dim)
 
-        q4 = unpack_bits(q4, num_bits=4, symmetric=False, dim=dim, group_last=group_last)
         q2 = unpack_bits(q2, num_bits=2, symmetric=False, dim=dim, group_last=group_last)
+        q4 = unpack_bits(q4, num_bits=4, symmetric=False, dim=dim, group_last=group_last)
 
         q = q4 | (q2 << 4)
 
@@ -128,18 +126,18 @@ def unpack_bits(
     elif num_bits == 3:
         q1, q2 = split_by_ratio(q, ratios=(1, 2), dim=dim)
 
-        q2 = unpack_bits(q2, num_bits=2, symmetric=False, dim=dim, group_last=group_last)
         q1 = unpack_bits(q1, num_bits=1, symmetric=False, dim=dim, group_last=group_last)
+        q2 = unpack_bits(q2, num_bits=2, symmetric=False, dim=dim, group_last=group_last)
 
         q = q2 | (q1 << 2)
 
     # AAAA_BBBB + CCCC_DDDD EEEE_FFFF GGGG_HHHH + aabb_ccdd + eeff_gghh + abcd_efgh
     elif num_bits == 7:
-        q4, q2, q1 = split_by_ratio(q, ratios=(4, 2, 1), dim=dim)
+        q1, q2, q4 = split_by_ratio(q, ratios=(1, 2, 4), dim=dim)
 
-        q4 = unpack_bits(q4, num_bits=4, symmetric=False, dim=dim, group_last=group_last)
-        q2 = unpack_bits(q2, num_bits=2, symmetric=False, dim=dim, group_last=group_last)
         q1 = unpack_bits(q1, num_bits=1, symmetric=False, dim=dim, group_last=group_last)
+        q2 = unpack_bits(q2, num_bits=2, symmetric=False, dim=dim, group_last=group_last)
+        q4 = unpack_bits(q4, num_bits=4, symmetric=False, dim=dim, group_last=group_last)
 
         q = q4 | (q2 << 4) | (q1 << 6)
 
@@ -158,6 +156,9 @@ def pack_scalar(
 ) -> Tensor:
     dtype = parse_precision(precision)
 
+    if dim == x.ndim - 1:
+        return x.to(dtype).view(torch.uint8)
+
     x = x.swapaxes(dim, -1)
     x = x.to(dtype).contiguous().view(torch.uint8)
     x = x.swapaxes(dim, -1)
@@ -172,8 +173,11 @@ def unpack_scalar(
 ) -> Tensor:
     dtype = parse_precision(precision)
 
+    if dim == x.ndim - 1:
+        return x.contiguous().view(dtype)
+
     x = x.swapaxes(dim, -1)
-    x = x.view(dtype)
+    x = x.contiguous().view(dtype)
     x = x.swapaxes(dim, -1)
 
     return x

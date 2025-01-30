@@ -11,6 +11,10 @@ def get_num_states(num_bits: Bits, /):
     return 1 << num_bits
 
 
+def get_bit_mask(num_bits: Bits, /):
+    return (1 << num_bits) - 1
+
+
 def get_bit_range(num_bits: Bits, symmetric: bool, /):
     num_states = get_num_states(num_bits)
 
@@ -85,3 +89,12 @@ def parse_precision(precision: Literal["fp32", "fp16", "bf16", "fp8"], /) -> tor
         return torch.float8_e4m3fn
 
     raise ValueError(f"Invalid precision: {precision}")
+
+
+def effective_num_bits(x: Tensor, Q: Tensor, /) -> float:
+    assert Q.dtype == torch.uint8
+
+    q_total_bits = Q.numel() * 8  # each byte in q is 8 bits
+    effective_bits = q_total_bits / x.numel()
+
+    return effective_bits
