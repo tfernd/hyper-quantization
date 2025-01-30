@@ -10,9 +10,3 @@ class QuantizedParameters(NamedTuple):
     q: Tensor
     scale: Tensor
     xmin: Optional[Tensor]
-
-
-class DoubleQuantizedParameters(NamedTuple):
-    q: Tensor
-    qsx_scale: QuantizedParameters
-    qsx_xmin: Optional[QuantizedParameters]

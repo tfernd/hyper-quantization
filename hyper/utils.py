@@ -98,3 +98,46 @@ def effective_num_bits(x: Tensor, Q: Tensor, /) -> float:
     effective_bits = q_total_bits / x.numel()
 
     return effective_bits
+
+
+def block_normalized_loss(x: Tensor, y: Tensor, /, block_size: int, dim=1) -> float:
+    assert x.shape == y.shape
+
+    x = x.unflatten(dim, sizes=(-1, block_size))
+    y = y.unflatten(dim, sizes=(-1, block_size))
+
+    block_error = x.sub(y).abs().float().mean(dim) * safe_reciprocal(x.std(dim, unbiased=True))
+    return block_error.mean().item()
+
+
+def quant_name(
+    num_bits: Bits,
+    block_size: int,
+    symmetric: bool,
+    group_last: bool,
+    store_precision: Literal["fp16", "bf16", "fp8"],
+) -> str:
+    s = "s" if symmetric else "a"
+    g = "g" if group_last else ""
+    p = "" if store_precision == "fp16" else f"_{store_precision}"
+
+    return f"Q{num_bits}{s}{block_size}{g}{p}"
+
+
+def double_quant_name(
+    num_bits: tuple[Bits, Bits],
+    block_size: tuple[int, int],
+    symmetric: tuple[bool, bool],
+    group_last: bool,
+    store_precision: Literal["fp16", "bf16", "fp8"],
+) -> str:
+    s0 = "s" if symmetric[0] else "a"
+    s1 = "s" if symmetric[1] else "a"
+    g = "g" if group_last else ""
+    p = "" if store_precision == "fp16" else f"_{store_precision}"
+
+    return f"Q({num_bits[0]}{s0}{block_size[0]})xQ({num_bits[1]}{s1}{block_size[1]}){g}{p}"
+
+
+def get_qsize(num_bits: Bits, block_size: int) -> int:
+    return num_bits * block_size // 8

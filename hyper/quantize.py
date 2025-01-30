@@ -4,10 +4,9 @@ from typing import Literal, Optional
 import torch
 from torch import Tensor
 
-from .bit_ops import bit_shift
 from .bit_packing import pack_bits, pack_scalar, unpack_bits, unpack_scalar
-from ._types import Bits, QuantizedParameters, DoubleQuantizedParameters
-from .utils import dynamic_split, get_bit_range, parse_precision, signed_max, min_max, safe_reciprocal
+from ._types import Bits, QuantizedParameters
+from .utils import dynamic_split, get_bit_range, get_qsize, parse_precision, signed_max, min_max, safe_reciprocal
 
 
 def get_scale_and_xmin(
@@ -76,42 +75,6 @@ def dequantize_tensor(
     return q * scale if xmin is None else q * scale + xmin
 
 
-def double_quantize_tensor(
-    x: Tensor,
-    /,
-    num_bits: tuple[Bits, Bits],
-    block_size: tuple[int, int] = (16, 16),
-    symmetric: tuple[bool, bool] = (True, True),
-    # *,
-    # dim: int = 1, # TODO add
-) -> DoubleQuantizedParameters:
-    # split into blocks, use higher precision for numerical stability
-    x = x.unflatten(dim=1, sizes=(-1, block_size[1] * block_size[0])).float().contiguous()
-
-    # first quantization
-    q, scale, xmin = quantize_tensor(x, num_bits[0], block_size[0], symmetric[0], dim=2)
-
-    # second quantize scale and xmin
-    qsx_scale = quantize_tensor(scale.flatten(1, 2), num_bits[1], block_size[1], symmetric[1])
-    if xmin is not None:
-        qsx_xmin = quantize_tensor(xmin.flatten(1, 2), num_bits[1], block_size[1], symmetric[1])
-    else:
-        qsx_xmin = None
-
-    qsx2 = DoubleQuantizedParameters(q, qsx_scale, qsx_xmin)
-
-    return qsx2
-
-
-def double_dequantize_tensor(qsx2: DoubleQuantizedParameters, /) -> Tensor:
-    q, qsx_scale, qsx_xmin = qsx2
-    scale = dequantize_tensor(*qsx_scale)
-    xmin = dequantize_tensor(*qsx_xmin) if qsx_xmin is not None else None
-    y = dequantize_tensor(q, scale, xmin)
-
-    return y
-
-
 def quantize(
     x: Tensor,
     /,
@@ -119,16 +82,13 @@ def quantize(
     block_size: int = 32,
     symmetric: bool = True,
     group_last: bool = True,
-    *,
     store_precision: Literal["fp16", "bf16", "fp8"] = "fp16",
+    *,
     dim: int = 1,
 ) -> Tensor:
     q, scale, xmin = quantize_tensor(x, num_bits, block_size, symmetric, dim=dim)
 
-    if symmetric:
-        q = bit_shift(q, num_bits)
     q = pack_bits(q, num_bits, group_last, dim=dim + 1)
-
     scale = pack_scalar(scale, store_precision, dim=dim + 1)
     xmin = pack_scalar(xmin, store_precision, dim=dim + 1) if xmin is not None else None
 
@@ -148,6 +108,7 @@ def dequantize(
     compute_precision: Optional[Literal["fp32", "fp16", "bf16"]] = None,
     dim: int = 1,
 ) -> Tensor:
+    # TODO DRY
     if store_precision == "fp8":
         assert compute_precision is not None
     elif compute_precision is None:
@@ -172,5 +133,66 @@ def dequantize(
 
     y = dequantize_tensor(q, scale, xmin)
     y = y.flatten(dim, dim + 1)
+
+    return y
+
+
+def double_quantize(
+    x: Tensor,
+    /,
+    num_bits: tuple[Bits, Bits],
+    block_size: tuple[int, int] = (16, 16),
+    symmetric: tuple[bool, bool] = (True, True),
+    group_last: bool = True,
+    store_precision: Literal["fp16", "bf16", "fp8"] = "fp16",
+    *,
+    dim: int = 1,
+) -> Tensor:
+    x = x.unflatten(dim=1, sizes=(-1, block_size[1] * block_size[0]))
+
+    q, scale, xmin = quantize_tensor(x, num_bits[0], block_size[0], symmetric[0], dim=dim + 1)
+
+    q = pack_bits(q, num_bits[0], group_last, dim=dim + 2)
+    q = q.flatten(dim + 1)
+
+    scale = quantize(scale.flatten(dim), num_bits[1], block_size[1], symmetric[1], group_last, store_precision, dim=dim)
+    if xmin is not None:
+        xmin = quantize(xmin.flatten(dim), num_bits[1], block_size[1], symmetric[1], group_last, store_precision, dim=dim)
+
+    Q = torch.cat([q, scale] if xmin is None else [q, scale, xmin], dim=dim + 1)
+
+    return Q
+
+
+def double_dequantize(
+    Q: Tensor,
+    /,
+    num_bits: tuple[Bits, Bits],
+    block_size: tuple[int, int] = (16, 16),
+    symmetric: tuple[bool, bool] = (True, True),
+    group_last: bool = True,
+    store_precision: Literal["fp16", "bf16", "fp8"] = "fp16",
+    compute_precision: Optional[Literal["fp32", "fp16", "bf16"]] = None,
+    *,
+    dim: int = 1,
+) -> Tensor:
+    qsize = get_qsize(num_bits[0], block_size[0]) * block_size[1]
+    if symmetric[0]:
+        q, scale = dynamic_split(Q, sizes=(qsize, -1), dim=dim + 1)
+        xmin = None
+    else:
+        sx_size = (Q.size(dim + 1) - qsize) // 2
+        q, scale, xmin = dynamic_split(Q, sizes=(qsize, sx_size, sx_size), dim=dim + 1)
+    q = q.unflatten(dim + 1, sizes=(block_size[1], -1))
+    q = unpack_bits(q, num_bits[0], symmetric[0], group_last, dim=dim + 2)
+
+    scale = dequantize(scale, num_bits[1], symmetric[1], group_last, store_precision=store_precision, compute_precision=compute_precision, dim=dim)
+    scale = scale.unflatten(dim, sizes=(-1, block_size[1], 1))
+    if xmin is not None:
+        xmin = dequantize(xmin, num_bits[1], symmetric[1], group_last, store_precision=store_precision, compute_precision=compute_precision, dim=dim)
+        xmin = xmin.unflatten(dim, sizes=(-1, block_size[1], 1))
+
+    y = dequantize_tensor(q, scale, xmin)
+    y = y.flatten(dim, dim + 2)
 
     return y
